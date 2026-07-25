@@ -18,7 +18,10 @@ Both shell out to **ffmpeg** for transcode/tagging.
 **Delivery:** downloaded tracks are uploaded to **Dropbox** (its desktop app then
 syncs them down to a Mac → USB for DJing). A local JSON **ledger** records what's
 been delivered — identity, provenance, timestamps — so Dropbox storage can later
-be reconciled against a USB and safely pruned. A DB replaces the JSON later.
+be reconciled against a USB and safely pruned. It also records **failures**: a
+track that fails to download or upload lands as a durable retry unit (stage,
+error, and the local file if one survived), so the stragglers can be retried later
+instead of being lost to a log line. A DB replaces the JSON later.
 
 Client will be an **Expo / React Native** app (iOS first, Android later).
 
@@ -31,8 +34,9 @@ IPs), lossless engines, and the USB-reconcile client.
 cratewire/
   server/            # FastAPI + download engines (this repo, for now)
     app/main.py      # FastAPI app: /health, /version
-    app/storage/     # dropbox.py (upload), ledger.py (delivery record)
-    scripts/         # smoke_*.py (prove pipelines), mint_dropbox_token.py
+    app/storage/     # dropbox.py (upload), ledger.py (delivery + failure record)
+    scripts/         # smoke_*.py (prove pipelines), retry_failures.py, mint_dropbox_token.py
+    tests/           # test_ledger_failures.py (stdlib-only, no network)
     data/            # ledger.json — the delivery record (gitignored)
     Dockerfile       # python:3.12-slim + ffmpeg + uv
   client/            # Expo app (not built yet)
@@ -55,6 +59,16 @@ uv run python scripts/smoke_streamrip.py
 
 # Prove the full Dropbox delivery leg (needs the Dropbox setup below):
 uv run python scripts/smoke_dropbox.py
+
+# Deliver a whole playlist; failed tracks are logged to the ledger for retry:
+uv run python scripts/smoke_playlist.py
+
+# Retry the deliveries the ledger recorded as failed:
+uv run python scripts/retry_failures.py --dry-run   # list what's pending
+uv run python scripts/retry_failures.py             # re-attempt them
+
+# Unit-test the ledger's failure API (stdlib only, no network):
+uv run python tests/test_ledger_failures.py
 
 # Run the API:
 uv run uvicorn app.main:app --reload

@@ -22,6 +22,11 @@ Partial failure is expected at playlist scale: one track failing to match, being
 unavailable, or throttled must not abort the batch. Each track is handled in its
 own try/except; the run ends with a success/failure summary.
 
+Failures are RECORDED to the ledger (not just printed): download-stage no-matches
+and per-track delivery failures land as `FailureEntry` rows, tagged with the stage
+and — for delivery failures — the local file left on disk. That makes them a
+durable work-list: `scripts/retry_failures.py` picks up the pending ones later.
+
 Run (needs the DROPBOX_* env vars set — see .env.example / mint script):
     uv run python scripts/smoke_playlist.py
     uv run python scripts/smoke_playlist.py --playlist "https://open.spotify.com/playlist/..."
@@ -74,6 +79,26 @@ AUDIO_PROVIDERS = ["youtube-music", "youtube"]
 #   Downloaded "Basement Jaxx - Where's Your Head At": https://music.youtube.com/watch?v=abc...
 YT_URL_RE = re.compile(r"(?:youtube\.com/watch\?v=|youtu\.be/|music\.youtube\.com/watch\?v=)([\w-]{11})")
 DOWNLOADED_LINE_RE = re.compile(r'Downloaded\s+"(?P<name>.+?)":\s*(?P<url>\S+)')
+
+# spotdl prints, for a track it couldn't fetch, a canonical "no match" line like:
+#   LookupError: No results found for song: Artist - Title
+# Best-effort: these are download-stage failures — tracks that never produced a
+# file — and they're the most valuable thing to log for a later retry.
+NO_RESULTS_RE = re.compile(r"No results found for song:\s*(?P<name>.+)")
+
+
+class DeliveryError(Exception):
+    """A per-track delivery failure tagged with the stage it happened at.
+
+    The stage (metadata | upload | ledger) tells a later retry how much work is
+    salvageable — an upload-stage failure leaves the downloaded file on disk, so
+    retrying is just a re-upload.
+    """
+
+    def __init__(self, stage: str, cause: Exception) -> None:
+        super().__init__(f"{stage}: {cause}")
+        self.stage = stage
+        self.cause = cause
 
 
 def load_env_file(path: Path) -> None:
@@ -139,6 +164,23 @@ def parse_yt_ids(output: str) -> dict[str, str]:
     return ids
 
 
+def parse_download_failures(output: str) -> list[str]:
+    """Best-effort: track names spotdl reported it couldn't match, de-duplicated.
+
+    Returns [] if the output has no recognizable "no match" lines — we'd rather log
+    nothing than log noise, so unrecognized failure phrasings are simply skipped.
+    """
+    seen: set[str] = set()
+    names: list[str] = []
+    for m in NO_RESULTS_RE.finditer(output):
+        name = m.group("name").strip()
+        norm = _norm(name)
+        if norm and norm not in seen:
+            seen.add(norm)
+            names.append(name)
+    return names
+
+
 def match_yt_id(stem: str, yt_ids: dict[str, str]) -> str | None:
     """Loosely match a filename stem to a parsed 'Downloaded ...' entry."""
     key = _norm(stem)
@@ -177,6 +219,7 @@ def read_tags(path: Path) -> dict[str, object]:
 def deliver_track(
     local_path: Path,
     *,
+    key: str,
     playlist_url: str,
     playlist_name: str,
     yt_ids: dict[str, str],
@@ -184,10 +227,18 @@ def deliver_track(
     ledger: Ledger,
     keep_local: bool,
 ) -> str:
-    """Upload one downloaded track + upsert its ledger row. Returns its relative_path."""
-    tags = read_tags(local_path)
-    sha256 = compute_sha256(local_path)
-    size_bytes = local_path.stat().st_size
+    """Upload one downloaded track + upsert its ledger row. Returns its relative_path.
+
+    Each stage is wrapped so a failure raises a `DeliveryError` tagged with where
+    it broke; the caller logs that into the ledger for a later retry. On success,
+    any prior failure recorded under `key` is resolved.
+    """
+    try:
+        tags = read_tags(local_path)  # best-effort internally; grouped here anyway
+        sha256 = compute_sha256(local_path)
+        size_bytes = local_path.stat().st_size
+    except Exception as exc:  # noqa: BLE001 - tagged + re-raised for the caller to log
+        raise DeliveryError("metadata", exc) from exc
 
     source = TrackSource(
         engine="spotdl",
@@ -197,28 +248,35 @@ def deliver_track(
         resolved_source_id=match_yt_id(local_path.stem, yt_ids),
     )
 
-    result = storage.upload(
-        local_path,
-        base_path=f"{SMOKE_BASE_PATH}/{playlist_name}",
-        delete_local=not keep_local,
-    )
+    try:
+        result = storage.upload(
+            local_path,
+            base_path=f"{SMOKE_BASE_PATH}/{playlist_name}",
+            delete_local=not keep_local,
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed upload leaves the local file for retry
+        raise DeliveryError("upload", exc) from exc
 
-    entry = TrackEntry(
-        relative_path=result.relative_path,
-        filename=result.filename,
-        artist=tags["artist"],  # type: ignore[arg-type]
-        title=tags["title"],  # type: ignore[arg-type]
-        album=tags["album"],  # type: ignore[arg-type]
-        ext=local_path.suffix.lstrip("."),
-        size_bytes=size_bytes,
-        duration_sec=tags["duration_sec"],  # type: ignore[arg-type]
-        bitrate_kbps=tags["bitrate_kbps"],  # type: ignore[arg-type]
-        content_sha256=sha256,
-        source=source,
-    )
-    entry.state.last_verified_at = utc_now_iso()
-    ledger.upsert(entry)
-    ledger.save()  # incremental: a crash mid-playlist keeps what's already done
+    try:
+        entry = TrackEntry(
+            relative_path=result.relative_path,
+            filename=result.filename,
+            artist=tags["artist"],  # type: ignore[arg-type]
+            title=tags["title"],  # type: ignore[arg-type]
+            album=tags["album"],  # type: ignore[arg-type]
+            ext=local_path.suffix.lstrip("."),
+            size_bytes=size_bytes,
+            duration_sec=tags["duration_sec"],  # type: ignore[arg-type]
+            bitrate_kbps=tags["bitrate_kbps"],  # type: ignore[arg-type]
+            content_sha256=sha256,
+            source=source,
+        )
+        entry.state.last_verified_at = utc_now_iso()
+        ledger.upsert(entry)
+        ledger.resolve_failure(key)  # this file is delivered now; clear any prior failure
+        ledger.save()  # incremental: a crash mid-playlist keeps what's already done
+    except Exception as exc:  # noqa: BLE001 - bytes are in Dropbox but the record didn't persist
+        raise DeliveryError("ledger", exc) from exc
     return result.relative_path
 
 
@@ -260,16 +318,39 @@ def main() -> None:
     yt_ids = parse_yt_ids(output)
     print(f"\ndownloaded {len(new_files)} file(s) into downloads/{playlist_name}/")
 
-    # 2-4. deliver each track (upload + ledger), tolerating per-track failure
-    print(f"\n=== 2. deliver {len(new_files)} track(s) to /_smoke_test/{playlist_name}/ ===")
     storage = DropboxStorage.from_env()
     ledger = Ledger.load(SMOKE_LEDGER)
+
+    # 2. log download-stage failures (tracks spotdl never produced a file for) so
+    #    they're retriable later — before, these vanished into spotdl's output.
+    download_failures = parse_download_failures(output)
+    for name in download_failures:
+        ledger.record_failure(
+            f"download:{_norm(name)}",
+            "download",
+            LookupError(f"spotdl found no match for {name!r}"),
+            engine="spotdl",
+            input_url=args.playlist,
+            input_type="spotify_playlist",
+            track_ref=name,
+        )
+    if download_failures:
+        ledger.save()
+        print(f"logged {len(download_failures)} download failure(s) to the ledger for retry")
+
+    # 3. deliver each downloaded track (upload + ledger), tolerating per-track failure.
+    #    Failures are recorded to the ledger (not just printed) so they can be retried.
+    print(f"\n=== 3. deliver {len(new_files)} track(s) to /_smoke_test/{playlist_name}/ ===")
     delivered: list[str] = []
     failures: list[tuple[str, str]] = []
     for i, local_path in enumerate(new_files, 1):
+        # Key on the file's slot in the playlist folder: stable across retries and
+        # equal to the eventual relative_path tail, so a re-run resolves this row.
+        key = f"deliver:{playlist_name}/{local_path.name}"
         try:
             rel = deliver_track(
                 local_path,
+                key=key,
                 playlist_url=args.playlist,
                 playlist_name=playlist_name,
                 yt_ids=yt_ids,
@@ -279,40 +360,60 @@ def main() -> None:
             )
             delivered.append(rel)
             print(f"  [{i}/{len(new_files)}] ok: {rel}")
-        except Exception as exc:  # noqa: BLE001 - one bad track must not abort the batch
+        except DeliveryError as exc:  # noqa: PERF203 - one bad track must not abort the batch
+            # A failed delivery leaves the local file in place -> retriable as a re-upload.
+            ledger.record_failure(
+                key,
+                exc.stage,
+                exc.cause,
+                engine="spotdl",
+                input_url=args.playlist,
+                input_type="spotify_playlist",
+                track_ref=local_path.stem,
+                relative_path=f"{SMOKE_BASE_PATH.lstrip('/')}/{playlist_name}/{local_path.name}",
+                filename=local_path.name,
+                local_path=str(local_path) if local_path.exists() else None,
+            )
+            ledger.save()
             failures.append((local_path.name, str(exc)))
-            print(f"  [{i}/{len(new_files)}] FAIL: {local_path.name} — {exc}")
+            print(f"  [{i}/{len(new_files)}] FAIL ({exc.stage}): {local_path.name} — {exc.cause}")
 
-    print(f"\nledger: {SMOKE_LEDGER}  ({len(ledger.tracks)} track(s) total)")
+    print(f"\nledger: {SMOKE_LEDGER}  ({len(ledger.tracks)} track(s), "
+          f"{len(ledger.pending_failures())} pending failure(s))")
 
-    # 5. round-trip (batch): how many synced back down to the Mac
+    # 4. round-trip (batch): how many synced back down to the Mac
     synced = None
     if args.no_round_trip:
-        print("\n=== 3. round-trip skipped (--no-round-trip) ===")
+        print("\n=== 4. round-trip skipped (--no-round-trip) ===")
     else:
-        print(f"\n=== 3. round-trip (waiting up to {args.sync_timeout}s for desktop sync) ===")
+        print(f"\n=== 4. round-trip (waiting up to {args.sync_timeout}s for desktop sync) ===")
         synced = count_synced(playlist_name, args.local_sync_dir, len(delivered), args.sync_timeout)
         loc = args.local_sync_dir or "~/Dropbox/Apps/<AppName>"
         print(f"synced to Mac: {synced}/{len(delivered)} in {loc}/_smoke_test/{playlist_name}/")
 
-    # 6. optional cleanup (default: keep the files for the user to inspect)
+    # 5. optional cleanup (default: keep the files for the user to inspect)
     if args.cleanup and delivered:
-        print("\n=== 4. cleanup ===")
+        print("\n=== 5. cleanup ===")
         storage.delete(f"{SMOKE_BASE_PATH}/{playlist_name}")
         print(f"deleted from Dropbox: {SMOKE_BASE_PATH}/{playlist_name}")
     else:
         print(f"\n=== kept in Dropbox: {SMOKE_BASE_PATH}/{playlist_name}/ (inspect later) ===")
 
     # summary
+    pending = ledger.pending_failures()
     print("\n" + "=" * 60)
     print(f"SUMMARY  playlist={playlist_name!r}")
-    print(f"  downloaded: {len(new_files)}")
-    print(f"  delivered:  {len(delivered)}")
-    print(f"  failed:     {len(failures)}")
+    print(f"  downloaded:        {len(new_files)}")
+    print(f"  delivered:         {len(delivered)}")
+    print(f"  download failures: {len(download_failures)}")
+    print(f"  deliver failures:  {len(failures)}")
     if synced is not None:
         print(f"  synced back to Mac: {synced}/{len(delivered)}")
     for name, err in failures:
         print(f"    - {name}: {err}")
+    if pending:
+        print(f"  ledger pending failures: {len(pending)} — retry later with:")
+        print("    uv run python scripts/retry_failures.py")
     print("=" * 60)
 
     if failures and not delivered:
