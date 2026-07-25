@@ -13,5 +13,8 @@ __pycache__/
 server/downloads/
 downloads/
 
+# Local ledger / working data (DB replaces this later; never commit)
+server/data/
+
 # OS
 .DS_Store

@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "dropbox>=12.2.1",
     "fastapi>=0.103.2",
     "spotdl>=4.5.2",
     "streamrip>=2.1.0",

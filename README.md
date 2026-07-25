@@ -15,17 +15,25 @@ writes tagged audio to a local folder. Two engines so far:
 
 Both shell out to **ffmpeg** for transcode/tagging.
 
+**Delivery:** downloaded tracks are uploaded to **Dropbox** (its desktop app then
+syncs them down to a Mac → USB for DJing). A local JSON **ledger** records what's
+been delivered — identity, provenance, timestamps — so Dropbox storage can later
+be reconciled against a USB and safely pruned. A DB replaces the JSON later.
+
 Client will be an **Expo / React Native** app (iOS first, Android later).
 
 Deliberately deferred until needed: multi-user + auth (better-auth in a Node
 service, added in front later), a job queue / scheduler for automated downloads,
-cloud/Dropbox delivery, and yt-dlp proxying for datacenter IPs.
+running the downloader on a 24/7 cloud host (and yt-dlp proxying for datacenter
+IPs), lossless engines, and the USB-reconcile client.
 
 ```
 cratewire/
   server/            # FastAPI + download engines (this repo, for now)
     app/main.py      # FastAPI app: /health, /version
-    scripts/         # smoke_spotdl.py, smoke_streamrip.py — prove the pipelines
+    app/storage/     # dropbox.py (upload), ledger.py (delivery record)
+    scripts/         # smoke_*.py (prove pipelines), mint_dropbox_token.py
+    data/            # ledger.json — the delivery record (gitignored)
     Dockerfile       # python:3.12-slim + ffmpeg + uv
   client/            # Expo app (not built yet)
 ```
@@ -45,10 +53,33 @@ uv run python scripts/smoke_spotdl.py --download   # + real download
 # Prove the streamrip (SoundCloud, free) pipeline:
 uv run python scripts/smoke_streamrip.py
 
+# Prove the full Dropbox delivery leg (needs the Dropbox setup below):
+uv run python scripts/smoke_dropbox.py
+
 # Run the API:
 uv run uvicorn app.main:app --reload
 # -> http://127.0.0.1:8000/health   http://127.0.0.1:8000/version
 ```
+
+### Dropbox delivery setup (one-time)
+
+`smoke_dropbox.py` downloads a track, uploads it to `/_smoke_test/` in a
+dedicated Dropbox app folder, waits for it to sync back down to this Mac, then
+cleans up. To run it you need a Dropbox app + refresh token:
+
+1. Create a **dedicated** app at <https://www.dropbox.com/developers/apps> →
+   **Scoped access** → **App folder** (sandboxed to `/Apps/<AppName>/`). On the
+   **Permissions** tab enable `files.content.write` + `files.content.read`.
+2. `cp .env.example .env`, then paste the app's **App key** / **App secret** into
+   `DROPBOX_ACCESS_KEY` / `DROPBOX_ACCESS_SECRET`.
+3. Mint a refresh token (opens a browser authorize flow):
+   ```bash
+   uv run python scripts/mint_dropbox_token.py
+   ```
+   Paste the printed `DROPBOX_REFRESH_TOKEN` into `.env`.
+
+Real downloads land under `DROPBOX_BASE_PATH` (default `/music`); the smoke test
+uses a separate `/_smoke_test/` path and deletes what it uploads.
 
 ### Docker
 
@@ -65,3 +96,6 @@ docker run --rm -p 8000:8000 cratewire-server
   own from the [Spotify dashboard](https://developer.spotify.com/dashboard).
 - **streamrip** works free on SoundCloud (no login). Lossless from Qobuz/Tidal
   requires a paid subscription configured in streamrip's config (`rip config path`).
+- **Dropbox** needs a dedicated App-folder app + refresh token — see the
+  [Dropbox delivery setup](#dropbox-delivery-setup-one-time) above. Credentials
+  live in `server/.env` (gitignored); the SDK auto-refreshes the access token.
