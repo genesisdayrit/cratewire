@@ -1,0 +1,17 @@
+# Python / uv
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Env / secrets
+.env
+.env.local
+
+# Downloaded audio (never commit)
+server/downloads/
+downloads/
+
+# OS
+.DS_Store
