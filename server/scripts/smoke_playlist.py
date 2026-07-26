@@ -27,10 +27,12 @@ and per-track delivery failures land as `FailureEntry` rows, tagged with the sta
 and — for delivery failures — the local file left on disk. That makes them a
 durable work-list: `scripts/retry_failures.py` picks up the pending ones later.
 
+The playlist URL is NOT hardcoded — pass it with --playlist, or set SMOKE_PLAYLIST_URL
+in server/.env (gitignored) so it stays out of the repo.
+
 Run (needs the DROPBOX_* env vars set — see .env.example / mint script):
-    uv run python scripts/smoke_playlist.py                 # the default: --name test
-    uv run python scripts/smoke_playlist.py --name original # a different named playlist
     uv run python scripts/smoke_playlist.py --playlist "https://open.spotify.com/playlist/..."
+    uv run python scripts/smoke_playlist.py                # uses SMOKE_PLAYLIST_URL from .env
     uv run python scripts/smoke_playlist.py --keep-local   # don't delete local temp downloads
     uv run python scripts/smoke_playlist.py --cleanup      # delete the folder from Dropbox at the end
     uv run python scripts/smoke_playlist.py --no-round-trip # skip the desktop-sync wait
@@ -59,15 +61,10 @@ from app.storage.ledger import (  # noqa: E402
     utc_now_iso,
 )
 
-# Named smoke-test playlists. Add a new one here and run it with `--name <key>`;
-# `--playlist <url>` still overrides for a one-off. Share ?si= tokens are kept as-is.
-PLAYLISTS: dict[str, str] = {
-    # A small throwaway playlist for exercising the pipeline (test for now).
-    "test": "https://open.spotify.com/playlist/4jOh2844dpSphEMo82Nv8T?si=8d794a78d6e84d29",
-    # The original batch-download target this script shipped with.
-    "original": "https://open.spotify.com/playlist/2wn2o6OxcBoVhVyYNPFYU6?si=47bdca74b47a45f8",
-}
-DEFAULT_PLAYLIST_NAME = "test"
+# The smoke-test playlist is supplied at runtime, not baked into the repo: pass
+# --playlist, or set this env var in server/.env (gitignored). Share ?si= tokens
+# are accepted as-is.
+PLAYLIST_ENV_VAR = "SMOKE_PLAYLIST_URL"
 DOWNLOAD_DIR = Path(__file__).resolve().parent.parent / "downloads"
 SMOKE_LEDGER = Path(__file__).resolve().parent.parent / "data" / "ledger.smoke.json"
 SMOKE_BASE_PATH = "/_smoke_test"
@@ -308,10 +305,8 @@ def count_synced(playlist_name: str, explicit_dir: str | None, expected: int, ti
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--name", choices=sorted(PLAYLISTS), default=DEFAULT_PLAYLIST_NAME,
-                        help=f"Named smoke-test playlist to run (default: {DEFAULT_PLAYLIST_NAME})")
     parser.add_argument("--playlist", default=None,
-                        help="Spotify playlist URL (overrides --name for a one-off)")
+                        help=f"Spotify playlist URL (falls back to ${PLAYLIST_ENV_VAR} in .env)")
     parser.add_argument("--keep-local", action="store_true", help="Don't delete local temp downloads")
     parser.add_argument("--cleanup", action="store_true",
                         help="Delete the playlist folder from Dropbox at the end (default: keep)")
@@ -321,12 +316,16 @@ def main() -> None:
     parser.add_argument("--download-timeout", type=int, default=2400, help="Seconds to allow spotdl to run")
     args = parser.parse_args()
 
-    # An explicit --playlist URL wins; otherwise resolve the named playlist.
-    if args.playlist is None:
-        args.playlist = PLAYLISTS[args.name]
-        print(f"playlist: {args.name!r} -> {args.playlist}")
-
     load_env_file(ENV_PATH)
+
+    # An explicit --playlist URL wins; otherwise fall back to the env var (.env).
+    if args.playlist is None:
+        args.playlist = os.environ.get(PLAYLIST_ENV_VAR)
+    if not args.playlist:
+        raise SystemExit(
+            f"No playlist given. Pass --playlist <url> or set {PLAYLIST_ENV_VAR} in server/.env"
+        )
+    print(f"playlist: {args.playlist}")
 
     # 1. download the whole playlist
     print("\n=== 1. spotdl download (playlist) ===")

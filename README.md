@@ -61,9 +61,8 @@ uv run python scripts/smoke_streamrip.py
 uv run python scripts/smoke_dropbox.py
 
 # Deliver a whole playlist; failed tracks are logged to the ledger for retry.
-# Defaults to the named "test" playlist; run a different one with --name / --playlist:
-uv run python scripts/smoke_playlist.py
-uv run python scripts/smoke_playlist.py --name original
+# Pass the playlist URL (or set SMOKE_PLAYLIST_URL in .env so it's not in git):
+uv run python scripts/smoke_playlist.py --playlist "https://open.spotify.com/playlist/..."
 
 # Retry the deliveries the ledger recorded as failed:
 uv run python scripts/retry_failures.py --dry-run   # list what's pending
