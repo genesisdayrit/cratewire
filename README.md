@@ -11,7 +11,12 @@ A single **FastAPI** server (Python) that runs download engines in-process and
 writes tagged audio to a local folder. Two engines so far:
 
 - **[spotdl](https://github.com/spotDL/spotify-downloader)** → YouTube (great for discovery; lossy)
-- **[streamrip](https://github.com/nathom/streamrip)** → SoundCloud (free), and Qobuz/Tidal/Deezer for lossless with credentials
+- **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** → SoundCloud (free). Preferred over
+  streamrip for SoundCloud: it pulls the single *progressive* MP3
+  (`http_mp3_1_0`), so there are no HLS segments to reassemble. streamrip 2.1.0
+  reorders those segments and produces silently-scrambled audio.
+- **[streamrip](https://github.com/nathom/streamrip)** → Qobuz/Tidal/Deezer for
+  lossless with credentials (deferred). Not used for SoundCloud — see above.
 
 Both shell out to **ffmpeg** for transcode/tagging.
 
@@ -54,7 +59,12 @@ uv sync
 uv run python scripts/smoke_spotdl.py
 uv run python scripts/smoke_spotdl.py --download   # + real download
 
-# Prove the streamrip (SoundCloud, free) pipeline:
+# Prove the SoundCloud (free) pipeline — yt-dlp, progressive stream + duration check:
+uv run python scripts/smoke_soundcloud.py
+uv run python scripts/smoke_soundcloud.py --url https://soundcloud.com/.../track
+
+# streamrip stays for future lossless (Qobuz/Tidal); its SoundCloud rip is
+# unreliable (reorders HLS segments) — kept only as an engine POC:
 uv run python scripts/smoke_streamrip.py
 
 # Prove the full Dropbox delivery leg (needs the Dropbox setup below):
