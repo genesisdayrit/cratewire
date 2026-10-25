@@ -50,6 +50,7 @@ cratewire/
 ## Server — quickstart
 
 Requires [uv](https://docs.astral.sh/uv/) and ffmpeg (`brew install ffmpeg`).
+[Deno](https://deno.com/) (`brew install deno`) is optional locally but recommended: yt-dlp uses it as a JavaScript runtime for YouTube.
 
 ```bash
 cd server

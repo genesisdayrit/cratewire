@@ -6,6 +6,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
+# Deno: JavaScript runtime yt-dlp needs to solve YouTube's JS challenges.
+COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
+
 # uv: fast, reproducible installs from the committed lockfile.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
