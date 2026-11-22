@@ -1,4 +1,7 @@
-"""Smoke-test the Dropbox delivery leg for a whole Spotify *playlist*.
+"""Smoke-test the delivery leg for a whole Spotify *playlist*.
+
+Honors `DELIVERY_DESTINATIONS` (dropbox, r2, or both). Dropbox is still the
+default. Dual-dest uploads keep the local file until every dest succeeds.
 
 This generalizes scripts/smoke_dropbox.py (single track, left intact as the
 reference) to fan out over every track in a playlist. Per the session's decision:
@@ -10,8 +13,9 @@ Proves, in order:
      downloads/<playlist name>/ subfolder (one m4a per track).
   2. For each downloaded file we read metadata + identity (tags via mutagen,
      sha256, best-effort YouTube source id parsed from spotdl output).
-  3. DropboxStorage uploads each file to /_smoke_test/<playlist name>/ via the API
-     and verifies it landed.
+  3. Each configured destination (Dropbox and/or R2) gets the file; Dropbox
+     lands under /_smoke_test/<playlist name>/, R2 under
+     {prefix}/music/cratewire/<playlist>/.
   4. Each track is upserted into the smoke ledger (server/data/ledger.smoke.json),
      written incrementally so a crash mid-playlist keeps the tracks already done.
   5. ROUND-TRIP (batch): we wait for the Dropbox desktop app to sync the folder
@@ -27,7 +31,7 @@ and per-track delivery failures land as `FailureEntry` rows, tagged with the sta
 and — for delivery failures — the local file left on disk. That makes them a
 durable work-list: `scripts/retry_failures.py` picks up the pending ones later.
 
-Run (needs the DROPBOX_* env vars set — see .env.example / mint script):
+Run (needs creds for whatever DELIVERY_DESTINATIONS lists — default dropbox):
     uv run python scripts/smoke_playlist.py
     uv run python scripts/smoke_playlist.py --playlist "https://open.spotify.com/playlist/..."
     uv run python scripts/smoke_playlist.py --keep-local   # don't delete local temp downloads
@@ -49,7 +53,12 @@ from pathlib import Path
 # Make `app` importable when run as scripts/smoke_playlist.py from server/.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.storage.dropbox import DropboxStorage  # noqa: E402
+from app.storage.destinations import (  # noqa: E402
+    failure_key,
+    load_storages,
+    parse_destinations,
+    upload_to,
+)
 from app.storage.ledger import (  # noqa: E402
     Ledger,
     TrackEntry,
@@ -92,13 +101,15 @@ class DeliveryError(Exception):
 
     The stage (metadata | upload | ledger) tells a later retry how much work is
     salvageable — an upload-stage failure leaves the downloaded file on disk, so
-    retrying is just a re-upload.
+    retrying is just a re-upload. `destination` is set when the failure is
+    specific to one backend (Dropbox vs R2).
     """
 
-    def __init__(self, stage: str, cause: Exception) -> None:
+    def __init__(self, stage: str, cause: Exception, destination: str | None = None) -> None:
         super().__init__(f"{stage}: {cause}")
         self.stage = stage
         self.cause = cause
+        self.destination = destination
 
 
 def load_env_file(path: Path) -> None:
@@ -216,22 +227,29 @@ def read_tags(path: Path) -> dict[str, object]:
     return info
 
 
+def _intended_path(dest_name: str, playlist_name: str, filename: str, storages: dict) -> str:
+    """Best-effort remote path/key a retry would target for this dest."""
+    if dest_name == "r2" and "r2" in storages:
+        return storages["r2"].build_key(filename, crate=playlist_name)
+    return f"{SMOKE_BASE_PATH.lstrip('/')}/{playlist_name}/{filename}"
+
+
 def deliver_track(
     local_path: Path,
     *,
-    key: str,
     playlist_url: str,
     playlist_name: str,
     yt_ids: dict[str, str],
-    storage: DropboxStorage,
+    destinations: tuple[str, ...],
+    storages: dict,
     ledger: Ledger,
     keep_local: bool,
-) -> str:
-    """Upload one downloaded track + upsert its ledger row. Returns its relative_path.
+) -> tuple[list[str], list[tuple[str, Exception]]]:
+    """Upload one downloaded track to each configured dest + upsert ledger rows.
 
-    Each stage is wrapped so a failure raises a `DeliveryError` tagged with where
-    it broke; the caller logs that into the ledger for a later retry. On success,
-    any prior failure recorded under `key` is resolved.
+    Returns (dropbox relative_paths that landed, per-dest upload errors). Each
+    dest is independent: a Dropbox success is recorded even if R2 fails, and
+    vice versa. Local delete happens only after every dest succeeded.
     """
     try:
         tags = read_tags(local_path)  # best-effort internally; grouped here anyway
@@ -248,36 +266,49 @@ def deliver_track(
         resolved_source_id=match_yt_id(local_path.stem, yt_ids),
     )
 
-    try:
-        result = storage.upload(
-            local_path,
-            base_path=f"{SMOKE_BASE_PATH}/{playlist_name}",
-            delete_local=not keep_local,
-        )
-    except Exception as exc:  # noqa: BLE001 - a failed upload leaves the local file for retry
-        raise DeliveryError("upload", exc) from exc
+    dropbox_paths: list[str] = []
+    dest_errors: list[tuple[str, Exception]] = []
+    for dest_name in destinations:
+        try:
+            result = upload_to(
+                dest_name,
+                storages[dest_name],
+                local_path,
+                dropbox_base_path=f"{SMOKE_BASE_PATH}/{playlist_name}",
+                r2_crate=playlist_name,
+                delete_local=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed upload leaves the local file for retry
+            dest_errors.append((dest_name, exc))
+            continue
 
-    try:
-        entry = TrackEntry(
-            relative_path=result.relative_path,
-            filename=result.filename,
-            artist=tags["artist"],  # type: ignore[arg-type]
-            title=tags["title"],  # type: ignore[arg-type]
-            album=tags["album"],  # type: ignore[arg-type]
-            ext=local_path.suffix.lstrip("."),
-            size_bytes=size_bytes,
-            duration_sec=tags["duration_sec"],  # type: ignore[arg-type]
-            bitrate_kbps=tags["bitrate_kbps"],  # type: ignore[arg-type]
-            content_sha256=sha256,
-            source=source,
-        )
-        entry.state.last_verified_at = utc_now_iso()
-        ledger.upsert(entry)
-        ledger.resolve_failure(key)  # this file is delivered now; clear any prior failure
-        ledger.save()  # incremental: a crash mid-playlist keeps what's already done
-    except Exception as exc:  # noqa: BLE001 - bytes are in Dropbox but the record didn't persist
-        raise DeliveryError("ledger", exc) from exc
-    return result.relative_path
+        try:
+            entry = TrackEntry(
+                relative_path=result.relative_path,
+                filename=result.filename,
+                destination=result.destination,
+                artist=tags["artist"],  # type: ignore[arg-type]
+                title=tags["title"],  # type: ignore[arg-type]
+                album=tags["album"],  # type: ignore[arg-type]
+                ext=local_path.suffix.lstrip("."),
+                size_bytes=size_bytes,
+                duration_sec=tags["duration_sec"],  # type: ignore[arg-type]
+                bitrate_kbps=tags["bitrate_kbps"],  # type: ignore[arg-type]
+                content_sha256=sha256,
+                source=source,
+            )
+            entry.state.last_verified_at = utc_now_iso()
+            ledger.upsert(entry)
+            ledger.resolve_failure(failure_key(f"{playlist_name}/{local_path.name}", dest_name))
+            ledger.save()  # incremental: a crash mid-playlist keeps what's already done
+        except Exception as exc:  # noqa: BLE001 - bytes landed but the record didn't persist
+            raise DeliveryError("ledger", exc) from exc
+        if result.destination == "dropbox":
+            dropbox_paths.append(result.relative_path)
+
+    if not keep_local and not dest_errors:
+        local_path.unlink(missing_ok=True)
+    return dropbox_paths, dest_errors
 
 
 def count_synced(playlist_name: str, explicit_dir: str | None, expected: int, timeout: int) -> int:
@@ -318,7 +349,9 @@ def main() -> None:
     yt_ids = parse_yt_ids(output)
     print(f"\ndownloaded {len(new_files)} file(s) into downloads/{playlist_name}/")
 
-    storage = DropboxStorage.from_env()
+    destinations = parse_destinations()
+    print(f"destinations: {', '.join(destinations)}")
+    storages = load_storages(destinations)
     ledger = Ledger.load(SMOKE_LEDGER)
 
     # 2. log download-stage failures (tracks spotdl never produced a file for) so
@@ -340,51 +373,71 @@ def main() -> None:
 
     # 3. deliver each downloaded track (upload + ledger), tolerating per-track failure.
     #    Failures are recorded to the ledger (not just printed) so they can be retried.
-    print(f"\n=== 3. deliver {len(new_files)} track(s) to /_smoke_test/{playlist_name}/ ===")
+    dest_note = ", ".join(destinations)
+    print(f"\n=== 3. deliver {len(new_files)} track(s) to [{dest_note}] ({playlist_name}) ===")
     delivered: list[str] = []
     failures: list[tuple[str, str]] = []
     for i, local_path in enumerate(new_files, 1):
-        # Key on the file's slot in the playlist folder: stable across retries and
-        # equal to the eventual relative_path tail, so a re-run resolves this row.
-        key = f"deliver:{playlist_name}/{local_path.name}"
+        slot = f"{playlist_name}/{local_path.name}"
         try:
-            rel = deliver_track(
+            rels, dest_errors = deliver_track(
                 local_path,
-                key=key,
                 playlist_url=args.playlist,
                 playlist_name=playlist_name,
                 yt_ids=yt_ids,
-                storage=storage,
+                destinations=destinations,
+                storages=storages,
                 ledger=ledger,
                 keep_local=args.keep_local,
             )
-            delivered.append(rel)
-            print(f"  [{i}/{len(new_files)}] ok: {rel}")
-        except DeliveryError as exc:  # noqa: PERF203 - one bad track must not abort the batch
-            # A failed delivery leaves the local file in place -> retriable as a re-upload.
+        except DeliveryError as exc:  # noqa: PERF203 - metadata/ledger must not abort the batch
+            dest = exc.destination or destinations[0]
             ledger.record_failure(
-                key,
+                failure_key(slot, dest),
                 exc.stage,
                 exc.cause,
                 engine="spotdl",
                 input_url=args.playlist,
                 input_type="spotify_playlist",
                 track_ref=local_path.stem,
-                relative_path=f"{SMOKE_BASE_PATH.lstrip('/')}/{playlist_name}/{local_path.name}",
+                relative_path=_intended_path(dest, playlist_name, local_path.name, storages),
                 filename=local_path.name,
+                destination=dest,
                 local_path=str(local_path) if local_path.exists() else None,
             )
             ledger.save()
             failures.append((local_path.name, str(exc)))
-            print(f"  [{i}/{len(new_files)}] FAIL ({exc.stage}): {local_path.name} — {exc.cause}")
+            print(f"  [{i}/{len(new_files)}] FAIL ({exc.stage}/{dest}): {local_path.name} — {exc.cause}")
+            continue
+
+        delivered.extend(rels)
+        for dest, cause in dest_errors:
+            ledger.record_failure(
+                failure_key(slot, dest),
+                "upload",
+                cause,
+                engine="spotdl",
+                input_url=args.playlist,
+                input_type="spotify_playlist",
+                track_ref=local_path.stem,
+                relative_path=_intended_path(dest, playlist_name, local_path.name, storages),
+                filename=local_path.name,
+                destination=dest,
+                local_path=str(local_path) if local_path.exists() else None,
+            )
+            ledger.save()
+            failures.append((local_path.name, f"upload/{dest}: {cause}"))
+            print(f"  [{i}/{len(new_files)}] FAIL (upload/{dest}): {local_path.name} — {cause}")
+        if not dest_errors:
+            print(f"  [{i}/{len(new_files)}] ok: {local_path.name} -> {dest_note}")
 
     print(f"\nledger: {SMOKE_LEDGER}  ({len(ledger.tracks)} track(s), "
           f"{len(ledger.pending_failures())} pending failure(s))")
 
-    # 4. round-trip (batch): how many synced back down to the Mac
+    # 4. round-trip (batch): how many synced back down to the Mac (Dropbox only)
     synced = None
-    if args.no_round_trip:
-        print("\n=== 4. round-trip skipped (--no-round-trip) ===")
+    if "dropbox" not in destinations or args.no_round_trip:
+        print("\n=== 4. round-trip skipped ===")
     else:
         print(f"\n=== 4. round-trip (waiting up to {args.sync_timeout}s for desktop sync) ===")
         synced = count_synced(playlist_name, args.local_sync_dir, len(delivered), args.sync_timeout)
@@ -392,12 +445,19 @@ def main() -> None:
         print(f"synced to Mac: {synced}/{len(delivered)} in {loc}/_smoke_test/{playlist_name}/")
 
     # 5. optional cleanup (default: keep the files for the user to inspect)
-    if args.cleanup and delivered:
+    if args.cleanup:
         print("\n=== 5. cleanup ===")
-        storage.delete(f"{SMOKE_BASE_PATH}/{playlist_name}")
-        print(f"deleted from Dropbox: {SMOKE_BASE_PATH}/{playlist_name}")
+        if "dropbox" in storages:
+            storages["dropbox"].delete(f"{SMOKE_BASE_PATH}/{playlist_name}")
+            print(f"deleted from Dropbox: {SMOKE_BASE_PATH}/{playlist_name}")
+        if "r2" in storages:
+            print("R2 cleanup: use scripts/smoke_r2.py --cleanup for a single object; "
+                  "playlist objects are left in place so they can be inspected.")
     else:
-        print(f"\n=== kept in Dropbox: {SMOKE_BASE_PATH}/{playlist_name}/ (inspect later) ===")
+        if "dropbox" in destinations:
+            print(f"\n=== kept in Dropbox: {SMOKE_BASE_PATH}/{playlist_name}/ (inspect later) ===")
+        if "r2" in destinations:
+            print(f"=== kept in R2 under crate {playlist_name!r} (inspect later) ===")
 
     # summary
     pending = ledger.pending_failures()

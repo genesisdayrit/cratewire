@@ -33,7 +33,7 @@ from pathlib import Path, PurePosixPath
 # Make `app` importable when run as scripts/retry_failures.py from server/.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.storage.dropbox import DropboxStorage  # noqa: E402
+from app.storage.destinations import load_storages  # noqa: E402
 from app.storage.ledger import (  # noqa: E402
     FailureEntry,
     Ledger,
@@ -124,15 +124,33 @@ def _base_path_for(failure: FailureEntry) -> str:
     return f"{SMOKE_BASE_PATH}/_retries"
 
 
+def _r2_crate_for(failure: FailureEntry) -> str:
+    """Crate segment of an R2 key (`.../cratewire/{crate}/{filename}`)."""
+    if failure.relative_path:
+        parts = PurePosixPath(failure.relative_path).parts
+        if "cratewire" in parts:
+            i = parts.index("cratewire")
+            if i + 1 < len(parts) - 1:
+                return parts[i + 1]
+        parent = PurePosixPath(failure.relative_path).parent.name
+        if parent and parent != ".":
+            return parent
+    return "_retries"
+
+
 def retry_one(
     failure: FailureEntry,
     *,
-    storage: DropboxStorage,
+    storages: dict,
     ledger: Ledger,
     download_timeout: int,
     keep_local: bool,
 ) -> tuple[bool, str]:
     """Re-attempt a single failed delivery. Returns (succeeded, human note)."""
+    dest = failure.destination or "dropbox"
+    if dest not in storages:
+        storages.update(load_storages([dest]))
+
     # 1. get a local file: the one left behind, or a fresh re-download.
     local = Path(failure.local_path) if failure.local_path else None
     if local is not None and local.exists():
@@ -151,17 +169,23 @@ def retry_one(
     sha256 = compute_sha256(local)
     size_bytes = local.stat().st_size
 
-    # 3. upload to the failure's folder (or the retries folder for downloads).
-    result = storage.upload(
-        local,
-        base_path=_base_path_for(failure),
-        delete_local=not keep_local,
-    )
+    # 3. upload to the failure's original destination.
+    storage = storages[dest]
+    if dest == "r2":
+        key = storage.build_key(local.name, crate=_r2_crate_for(failure))
+        result = storage.upload(local, key, delete_local=not keep_local)
+    else:
+        result = storage.upload(
+            local,
+            base_path=_base_path_for(failure),
+            delete_local=not keep_local,
+        )
 
     # 4. record the delivered track + resolve the failure.
     entry = TrackEntry(
         relative_path=result.relative_path,
         filename=result.filename,
+        destination=result.destination,
         artist=tags["artist"],  # type: ignore[arg-type]
         title=tags["title"],  # type: ignore[arg-type]
         album=tags["album"],  # type: ignore[arg-type]
@@ -182,7 +206,7 @@ def retry_one(
     ledger.upsert(entry)
     ledger.resolve_failure(failure.key)
     ledger.save()
-    return True, f"{how} -> {result.relative_path}"
+    return True, f"{how} -> {dest}:{result.relative_path}"
 
 
 def main() -> None:
@@ -214,7 +238,7 @@ def main() -> None:
         print("\n--dry-run: retried nothing.")
         return
 
-    storage = DropboxStorage.from_env()
+    storages: dict = {}
     ok = 0
     still_failing = 0
     print(f"\n=== retrying {len(pending)} failure(s) ===")
@@ -222,7 +246,7 @@ def main() -> None:
         try:
             succeeded, note = retry_one(
                 failure,
-                storage=storage,
+                storages=storages,
                 ledger=ledger,
                 download_timeout=args.download_timeout,
                 keep_local=args.keep_local,

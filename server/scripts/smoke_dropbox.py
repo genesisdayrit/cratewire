@@ -188,6 +188,7 @@ def main() -> None:
     entry = TrackEntry(
         relative_path=result.relative_path,
         filename=result.filename,
+        destination=result.destination,
         artist=tags["artist"],  # type: ignore[arg-type]
         title=tags["title"],  # type: ignore[arg-type]
         album=tags["album"],  # type: ignore[arg-type]
