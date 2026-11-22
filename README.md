@@ -20,12 +20,13 @@ writes tagged audio to a local folder. Two engines so far:
 
 Both shell out to **ffmpeg** for transcode/tagging.
 
-**Delivery:** downloaded tracks are uploaded to **Dropbox** (its desktop app then
-syncs them down to a Mac → USB for DJing). A local JSON **ledger** records what's
-been delivered — identity, provenance, timestamps — so Dropbox storage can later
-be reconciled against a USB and safely pruned. It also records **failures**: a
-track that fails to download or upload lands as a durable retry unit (stage,
-error, and the local file if one survived), so the stragglers can be retried later
+**Delivery:** downloaded tracks upload to **Dropbox** (desktop app syncs them to a
+Mac → USB for DJing) and/or **Cloudflare R2** (website/radio). `DELIVERY_DESTINATIONS`
+selects `dropbox`, `r2`, or both. A local JSON **ledger** records what's been
+delivered — identity, provenance, destination, timestamps — so storage can later
+be reconciled and safely pruned. It also records **failures**: a track that fails
+to download or upload lands as a durable retry unit (stage, error, destination,
+and the local file if one survived), so the stragglers can be retried later
 instead of being lost to a log line. A DB replaces the JSON later.
 
 Client will be an **Expo / React Native** app (iOS first, Android later).
@@ -39,9 +40,9 @@ IPs), lossless engines, and the USB-reconcile client.
 cratewire/
   server/            # FastAPI + download engines (this repo, for now)
     app/main.py      # FastAPI app: /health, /version
-    app/storage/     # dropbox.py (upload), ledger.py (delivery + failure record)
+    app/storage/     # dropbox.py + r2.py (upload), ledger.py (delivery + failure record)
     scripts/         # smoke_*.py (prove pipelines), retry_failures.py, mint_dropbox_token.py
-    tests/           # test_ledger_failures.py (stdlib-only, no network)
+    tests/           # ledger + R2 unit tests (R2 uses moto; no live network)
     data/            # ledger.json — the delivery record (gitignored)
     Dockerfile       # python:3.12-slim + ffmpeg + uv
   client/            # Expo app (not built yet)
@@ -71,6 +72,10 @@ uv run python scripts/smoke_streamrip.py
 # Prove the full Dropbox delivery leg (needs the Dropbox setup below):
 uv run python scripts/smoke_dropbox.py
 
+# Prove the Cloudflare R2 delivery leg (needs the R2 setup below):
+uv run python scripts/smoke_r2.py
+uv run python scripts/smoke_r2.py --cleanup   # delete the object afterward
+
 # Deliver a whole playlist; failed tracks are logged to the ledger for retry:
 uv run python scripts/smoke_playlist.py
 
@@ -78,8 +83,9 @@ uv run python scripts/smoke_playlist.py
 uv run python scripts/retry_failures.py --dry-run   # list what's pending
 uv run python scripts/retry_failures.py             # re-attempt them
 
-# Unit-test the ledger's failure API (stdlib only, no network):
-uv run python tests/test_ledger_failures.py
+# Unit tests (ledger is stdlib-only; R2 uses moto, no live network):
+uv run pytest
+uv run python tests/test_ledger_failures.py   # ledger subset, no extra deps
 
 # Run the API:
 uv run uvicorn app.main:app --reload
@@ -106,6 +112,36 @@ cleans up. To run it you need a Dropbox app + refresh token:
 Real downloads land under `DROPBOX_BASE_PATH` (default `/music`); the smoke test
 uses a separate `/_smoke_test/` path and deletes what it uploads.
 
+### Cloudflare R2 delivery
+
+Same bucket/creds as the personal site (`R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
+`R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, optional `R2_PUBLIC_URL`,
+`R2_KEY_PREFIX` default `prod`). Endpoint is
+`https://<account_id>.r2.cloudflarestorage.com` (region `auto`, signature v4).
+
+Uncomment those vars in `server/.env` (see `.env.example`), then:
+
+```bash
+cd server
+uv run python scripts/smoke_r2.py
+# or: SMOKE_SPOTIFY_URL=https://open.spotify.com/track/... uv run python scripts/smoke_r2.py
+uv run python scripts/smoke_r2.py --cleanup   # delete the smoke object afterward
+```
+
+Default object key: `{prefix}/music/cratewire/{crate}/{artists} - {title}.{ext}`
+(same filename convention as Dropbox). Override with `R2_KEY_LAYOUT`.
+
+To send real (non-smoke) downloads to R2 as well as — or instead of — Dropbox:
+
+```
+DELIVERY_DESTINATIONS=dropbox,r2   # or just r2
+```
+
+R2 buckets are **private** unless you attach a custom domain or enable an
+`r2.dev` public development URL. Leave `R2_PUBLIC_URL` unset to keep objects
+private. Publicly hosting full copyrighted tracks is a legal risk; this path is
+for a personal crate, not a public download site.
+
 ### Docker
 
 ```bash
@@ -124,3 +160,6 @@ docker run --rm -p 8000:8000 cratewire-server
 - **Dropbox** needs a dedicated App-folder app + refresh token — see the
   [Dropbox delivery setup](#dropbox-delivery-setup-one-time) above. Credentials
   live in `server/.env` (gitignored); the SDK auto-refreshes the access token.
+- **Cloudflare R2** needs an API token with Object Read & Write on the bucket —
+  see [Cloudflare R2 delivery](#cloudflare-r2-delivery). Same env var names as
+  the personal-site bucket, so those creds can be reused.

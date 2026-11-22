@@ -147,6 +147,51 @@ def test_from_dict_roundtrip() -> None:
     assert FailureEntry.from_dict(f.to_dict()) == f
 
 
+def test_legacy_track_without_destination_loads() -> None:
+    """Pre-R2 v2 rows have no `destination`; they must still load (implicit dropbox)."""
+    tmp = Path(tempfile.mkdtemp()) / "ledger.json"
+    tmp.write_text(json.dumps({
+        "version": 2,
+        "updated_at": "2026-07-25T00:00:00Z",
+        "tracks": [{"relative_path": "music/old.m4a", "filename": "old.m4a"}],
+        "failures": [{"key": "k", "stage": "upload",
+                      "last_error_type": "E", "last_error_message": "m"}],
+    }))
+    led = Ledger.load(tmp)
+    assert led.tracks[0].destination is None
+    assert led.failures[0].destination is None
+    led.save()
+    assert json.loads(tmp.read_text())["version"] == SCHEMA_VERSION
+
+
+def test_upsert_records_destination_per_path() -> None:
+    """Same filename in two dests is two rows (keyed by relative_path)."""
+    led = _fresh_ledger()
+    led.upsert(TrackEntry(
+        relative_path="music/a.mp3", filename="a.mp3", destination="dropbox",
+    ))
+    led.upsert(TrackEntry(
+        relative_path="prod/music/cratewire/crate/a.mp3",
+        filename="a.mp3",
+        destination="r2",
+    ))
+    led.save()
+    reloaded = Ledger.load(led.path)
+    by_dest = {t.destination: t.relative_path for t in reloaded.tracks}
+    assert by_dest == {
+        "dropbox": "music/a.mp3",
+        "r2": "prod/music/cratewire/crate/a.mp3",
+    }
+
+
+def test_record_failure_destination_fill_forward() -> None:
+    led = _fresh_ledger()
+    led.record_failure("upload:x", "upload", RuntimeError("boom"), destination="r2")
+    led.record_failure("upload:x", "upload", RuntimeError("boom again"))
+    assert led.failures[0].destination == "r2"
+    assert led.failures[0].attempts == 2
+
+
 def _main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

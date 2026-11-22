@@ -1,4 +1,4 @@
-"""The delivery ledger — a JSON record of every track we've put in Dropbox.
+"""The delivery ledger — a JSON record of every track we've delivered.
 
 This is a deliberate stopgap before a real database. Its job: know what's been
 delivered (and its identity + provenance) so that later we can reconcile three
@@ -16,6 +16,8 @@ Design notes (grilled 2026-07-25):
   - Writes are atomic (temp file + os.replace) so a crash never truncates it.
   - `version` is the file's schema version — a migration marker for later field
     changes and the eventual DB import. Bump only when the *structure* changes.
+    Additive optional fields (e.g. `destination` on tracks/failures) keep the
+    current version; missing keys default so v1/v2 files still load.
   - Failures are recorded too, not just successes. A `FailureEntry` is a durable
     retry unit: enough to re-attempt a download/upload that fell over (throttling,
     no match, a transient API error) without re-deriving it. They live under a
@@ -106,6 +108,7 @@ class TrackEntry:
 
     relative_path: str  # e.g. "music/Rick Astley - Never Gonna Give You Up.mp3"
     filename: str
+    destination: Optional[str] = None  # dropbox | r2; None = legacy (implicit dropbox)
     artist: Optional[str] = None
     title: Optional[str] = None
     album: Optional[str] = None
@@ -162,8 +165,9 @@ class FailureEntry:
     input_url: Optional[str] = None  # what the user handed the engine (playlist/track URL)
     input_type: Optional[str] = None  # spotify_playlist | spotify_track | query | ...
     track_ref: Optional[str] = None  # human label / spotdl query, e.g. "Artist - Title"
-    relative_path: Optional[str] = None  # intended Dropbox destination, if known
+    relative_path: Optional[str] = None  # intended remote path/key, if known
     filename: Optional[str] = None
+    destination: Optional[str] = None  # dropbox | r2; None = legacy (implicit dropbox)
     local_path: Optional[str] = None  # downloaded file still on disk -> retry skips re-download
     status: str = "pending"  # pending | resolved (a retry succeeded) | abandoned (given up)
     attempts: int = 1
@@ -238,6 +242,7 @@ class Ledger:
         track_ref: Optional[str] = None,
         relative_path: Optional[str] = None,
         filename: Optional[str] = None,
+        destination: Optional[str] = None,
         local_path: Optional[str] = None,
     ) -> FailureEntry:
         """Log a failed delivery under `key`, or re-log a retry of the same key.
@@ -266,6 +271,7 @@ class Ledger:
                 track_ref=track_ref,
                 relative_path=relative_path,
                 filename=filename,
+                destination=destination,
                 local_path=local_path,
             )
             self.failures.append(entry)
@@ -286,6 +292,7 @@ class Ledger:
             ("track_ref", track_ref),
             ("relative_path", relative_path),
             ("filename", filename),
+            ("destination", destination),
             ("local_path", local_path),
         ):
             if val is not None:

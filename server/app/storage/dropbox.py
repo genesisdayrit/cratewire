@@ -14,7 +14,6 @@ refresh. With App-folder access, all paths are relative to the app root, e.g.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -22,17 +21,9 @@ import dropbox
 from dropbox.exceptions import ApiError
 from dropbox.files import FileMetadata, WriteMode
 
+from app.storage.base import UploadResult
 
-@dataclass
-class UploadResult:
-    """What an upload produced, in terms the ledger cares about."""
-
-    dropbox_path: str  # API path, leading slash, e.g. "/music/foo.mp3"
-    relative_path: str  # ledger key, no leading slash, e.g. "music/foo.mp3"
-    filename: str
-    size_bytes: int
-    rev: str  # Dropbox revision id
-    content_hash: str  # Dropbox's own content hash (not sha256; useful for integrity)
+__all__ = ["DropboxStorage", "UploadResult"]
 
 
 def _join(base_path: str, filename: str) -> str:
@@ -42,11 +33,9 @@ def _join(base_path: str, filename: str) -> str:
 
 
 class DropboxStorage:
-    """Concrete, adapter-shaped Dropbox uploader.
+    """Concrete, adapter-shaped Dropbox uploader (`Storage` in base.py)."""
 
-    Not abstracted behind a protocol yet (YAGNI) — but `upload()` is the seam a
-    future `Storage` interface would expose, so extraction later is mechanical.
-    """
+    name = "dropbox"
 
     def __init__(self, dbx: dropbox.Dropbox, base_path: str = "/music") -> None:
         self.dbx = dbx
@@ -110,6 +99,7 @@ class DropboxStorage:
 
         actual_path = verified.path_display or dest
         result = UploadResult(
+            destination="dropbox",
             dropbox_path=actual_path,
             relative_path=actual_path.lstrip("/"),
             filename=local_path.name,
